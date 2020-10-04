@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Population Flowfield</title>
+    <style>
+    	* { padding: 0; margin: 0; }
+    	canvas { background: #eee; display: block; margin: 0 auto; }
+    </style>
+
+    <script type="text/javascript" src="grid.js"></script>
+    <script type="text/javascript" src="population.js"></script>
+    <script type="text/javascript" src="vector2D.js"></script>
+    <script type="text/javascript" src="heap.js"></script>
+
+</head>
+<body>
+
+<canvas id="myCanvas" width="1000" height="500"></canvas>
+
+<script>
+//Convention for directions are: 0 = east, 1 = south, 2 = west, 3 = north
+
+    var grids = []; //Stores all the grids in the map
+    var gridHor = 0;
+    var gridVer = 0;
+    var agents = []; //Stores each individual agent
+
+    var densityField = [];
+    var avgVel = [];
+    var speeds = [];
+    var costs = [];
+    var gradPhi = [];
+    var discomfort = [];
+    var potential = [];
+    var velocities = []; //Velocities on the faces of the grids
+    var totalVel = []; // Sum of velocities of the faces of the grids
+    //Holds status for the fast marching algorithm: 0 - known/accepted, 1 - considered/candidate, 2 - unknown/far
+    var states = [];
+
+    var goals = [];
+
+    var alpha = 0.1;
+    var beta = 0.9;
+    var gamma = 0.5;
+
+
+    var canvas;
+    var ctx;
+    MS_PER_UPDATE = 60;
+
+    var lag = 0;
+    var prev = Date.now();
+    var elapsed;
+
+    var gridWidth = 20;
+
+    var lambda = 1; //The density falloff constant
+
+    var threshold = 15; //Pairwise threshold distance between agents
+
+    window.onload = init;
+
+    function init(){
+        canvas = document.getElementById('myCanvas');
+        ctx = canvas.getContext('2d');
+        gridHor = Math.floor(canvas.width / gridWidth) + 1;
+        gridVer = Math.floor(canvas.height / gridWidth) + 1;
+
+        //Populate the directional costs array
+        for (var j = -1; j < gridVer; j++){
+            for (var k = -1; k < gridHor; k++){
+                grids.push(new Grid(new Vector2D(k, j)));
+                densityField.push(0);
+                discomfort.push(0);
+                velocities.push(new Vector2D(0, 0), new Vector2D(0, 0),
+                    new Vector2D(0, 0), new Vector2D(0, 0));
+                potential.push(Infinity);
+                avgVel.push(new Vector2D(0, 0));
+                totalVel.push(new Vector2D(0, 0));
+                costs.push(new Array(0, 0, 0, 0));
+                gradPhi.push(new Array(0, 0, 0, 0));
+                speeds.push(new Array(0, 0, 0, 0));
+                states.push(2);
+            }
+        }
+
+        //Fill the map with agents
+        for (var i = 0; i < 20; i++){
+            var newPos = new Vector2D(i * 30 + 30, 475);
+            var newAgent = new Agent(newPos, 5, new Goal(0, 300, 0, 100), 10, i);
+
+            agents.push(newAgent);
+        }
+
+        // Start the first frame request
+        window.requestAnimationFrame(gameLoop);
+    }
+
+    //Clamp values between a and b, default a = 0, b = 1
+    function clamp(x, a = 0, b = 1){
+        if (x < a)
+            return a;
+        if (x > b)
+            return b;
+        return x;
+    }
+
+    // Returns the (x, y) coordinates of the center of the (i, j)-th grid
+    function getCenter(grid){
+        return new Vector2D((grid.x + 0.5) * gridWidth, (grid.y + 0.5) * gridWidth);
+    }
+
+    //Clamp to a small epsilon to prevent negative speeds
+    function small(n){
+      if (n <= 0)
+          return 0.01;
+      return n;
+    }
+
+    /*Grid layout is
+    D | C
+    ------
+    A | B
+    where A is the closest grid to agent
+    */
+    function calcDensities(){
+        agents.forEach(agent => {
+            closest = agent.closestGrid()
+            closestX = Math.floor(closest.x / gridWidth)
+            closestY = Math.floor(closest.y / gridWidth)
+            delta = agent.pos.subtract(closest).scalarMult(1.0 / gridWidth)
+            //Add densities to the neighboring grids
+            if (!outOfBounds(closestY, closestX)){
+                densityA = Math.pow(Math.min(1 - Math.abs(delta.x), 1 - Math.abs(delta.y)), lambda)
+                velA = agent.getVel().scalarMult(densityA)
+                densityField[(closestY + 1) * (gridHor + 1) + (closestX + 1)] += densityA
+                avgVel[(closestY + 1) * (gridHor + 1) + (closestX + 1)] =
+                avgVel[(closestY + 1) * (gridHor + 1) + (closestX + 1)].add(velA)
+            }
+
+            if (!outOfBounds(closestY, closestX + 1)){
+                densityB = Math.pow(Math.min(Math.abs(delta.x), 1 - Math.abs(delta.y)), lambda)
+                velB = agent.getVel().scalarMult(densityB)
+                densityField[(closestY + 1) * (gridHor + 1) + (closestX + 2)] += densityB
+                avgVel[(closestY + 1) * (gridHor + 1) + (closestX + 2)] =
+                avgVel[(closestY + 1) * (gridHor + 1) + (closestX + 2)].add(velB)
+            }
+
+            if (!outOfBounds(closestY - 1, closestX + 1)){
+                densityC = Math.pow(Math.min(Math.abs(delta.x), Math.abs(delta.y)), lambda)
+                velC = agent.getVel().scalarMult(densityC)
+                densityField[(closestY) * (gridHor + 1) + (closestX + 2)] += densityC
+                avgVel[(closestY) * (gridHor + 1) + (closestX + 2)] =
+                avgVel[(closestY) * (gridHor + 1) + (closestX + 2)].add(velC)
+            }
+
+            if (!outOfBounds(closestY - 1, closestX)){
+                densityD = Math.pow(Math.min(1 - Math.abs(delta.x), Math.abs(delta.y)), lambda)
+                velD = agent.getVel().scalarMult(densityD)
+                densityField[(closestY) * (gridHor + 1) + (closestX + 1)] += densityD
+                avgVel[(closestY) * (gridHor + 1) + (closestX + 1)] =
+                avgVel[(closestY) * (gridHor + 1) + (closestX + 1)].add(velD)
+            }
+          }
+        );
+        //Divide by total density of the cell
+        for (var i = 0; i < avgVel.length; i++){
+            d = densityField[i];
+            if (d != 0){
+                avgVel[i] = avgVel[i].scalarMult(1.0 / d);
+            }
+        }
+    }
+
+    function calcCosts(){
+        //Thresholds for density
+        var min = 0;
+        var max = 2;
+        //Topographic speed (for areas of low density) normalized at 1.0
+        var speedT = 1.0;
+        //We use an offset of one cell in the direction of the velocity
+        for (var j = 0; j < gridVer - 1; j++){
+            for (var k = 0; k < gridHor - 1; k++){
+                //Clamp flow speeds to [0.01, 1]
+                speedFlowEast = clamp(small(avgVel[(j + 1) * (gridHor + 1) + (k + 2)].x));
+                speedEast = speedT +
+                  clamp((densityField[(j + 1) * (gridHor + 1) + (k + 2)] - min) / (max - min)) * (speedFlowEast - speedT);
+
+                speedFlowSouth = clamp(small(avgVel[(j + 2) * (gridHor + 1) + (k + 1)].y));
+                speedSouth = speedT +
+                  clamp((densityField[(j + 2) * (gridHor + 1) + (k + 1)] - min) / (max - min)) * (speedFlowSouth - speedT);
+
+                speedFlowWest = clamp(small(-1.0 * avgVel[(j + 1) * (gridHor + 1) + k].x));
+                speedWest = speedT +
+                  clamp((densityField[(j + 1) * (gridHor + 1) + k] - min) / (max - min)) * (speedFlowWest - speedT);
+
+                speedFlowNorth = clamp(small(-1.0 * avgVel[j * (gridHor + 1) + (k + 1)].y));
+                speedNorth = speedT +
+                  clamp((densityField[j * (gridHor + 1) + (k + 1)] - min) / (max - min)) * (speedFlowNorth - speedT);
+                speeds[(j + 1) * (gridHor + 1) + (k + 1)][0] = speedEast;
+                speeds[(j + 1) * (gridHor + 1) + (k + 1)][1] = speedSouth;
+                speeds[(j + 1) * (gridHor + 1) + (k + 1)][2] = speedWest;
+                speeds[(j + 1) * (gridHor + 1) + (k + 1)][3] = speedNorth;
+                //Now calculate costs
+
+                costs[(j + 1) * (gridHor + 1) + (k + 1)][0] =
+                ((alpha * speedEast) + beta + (gamma * discomfort[(j + 1) * (gridHor + 1) + (k + 2)])) / (speedEast);
+
+                costs[(j + 1) * (gridHor + 1) + (k + 1)][1] =
+                ((alpha * speedSouth) + beta + (gamma * discomfort[(j + 2) * (gridHor + 1) + (k + 1)])) / (speedSouth);
+                costs[(j + 1) * (gridHor + 1) + (k + 1)][2] =
+                ((alpha * speedWest) + beta + (gamma * discomfort[(j + 1) * (gridHor + 1) + k])) / (speedWest);
+                costs[(j + 1) * (gridHor + 1) + (k + 1)][3] =
+                ((alpha * speedSouth) + beta + (gamma * discomfort[j * (gridHor + 1) + (k + 1)])) / (speedNorth);
+            }
+        }
+    }
+    function phiLookup(index){
+        return potential[index];
+    }
+    function calculatePotential(){
+      //Look up potential of a cells
+
+        goalarea = []; // Cells in the goal area
+        candidates = new Heap(1, phiLookup);
+        goal = new Goal(20, 30, 0, 3);
+        //Populate the known array with grids inside the goal area
+        for (var j = goal.minY; j < goal.maxY; j++){
+            for (var k = goal.minX; k < goal.maxX; k++){
+                //Push the (j, k) coords of grids, to be looked up later in the field arrays
+                goalarea.push((j + 1) * (gridHor + 1) + (k + 1));
+                states[(j + 1) * (gridHor + 1) + (k + 1)] = 0;
+                potential[(j + 1) * (gridHor + 1) + (k + 1)] = 0;
+            }
+        }
+
+        function calcNeighbors(neighbors){
+            neighbors.forEach(index => {
+                  if (states[index] != 0){ //If not yet known
+                      //The neighbor's neighbors' potentials
+                      adjacents = neighboringPotential(index)
+                      //Min directions
+                      minHor = 2 * (costs[index][0] + adjacents[0] > costs[index][2] + adjacents[2])
+                      minVer = 2 * (costs[index][1] + adjacents[1] > costs[index][3] + adjacents[3]) + 1
+                      var phi = Infinity; //The new potential we will calculate
+                      var a, b, c = 0;
+                      if (adjacents[minHor] < Infinity && adjacents[minVer] < Infinity){
+                          //Both directions have well-defined potentials
+                          a = Math.pow(1 / costs[index][minHor], 2) + Math.pow(1 / costs[index][minVer], 2)
+                          b = -2 * ((adjacents[minHor] * Math.pow(1 / costs[index][minHor], 2))
+                          + (adjacents[minVer] * Math.pow(1 / costs[index][minVer], 2)))
+                          c = Math.pow(adjacents[minHor] / costs[index][minHor], 2) + Math.pow(adjacents[minVer] / costs[index][minVer], 2) - 1
+                      } else if (adjacents[minHor] < Infinity && adjacents[minVer] == Infinity){
+                          //Horizontal directions has a well-defined potential
+                          a = Math.pow(1 / costs[index][minHor], 2)
+                          b = -2 * adjacents[minHor] * Math.pow(1 / costs[index][minHor], 2)
+                          c = Math.pow(adjacents[minHor] / costs[index][minHor], 2) - 1
+                      } else if (adjacents[minHor] == Infinity && adjacents[minVer] < Infinity){
+                          //Horizontal directions has a well-defined potential
+                          a = Math.pow(1 / costs[index][minVer], 2)
+                          b = -2 * adjacents[minVer] * Math.pow(1 / costs[index][minVer], 2)
+                          c = Math.pow(adjacents[minVer] / costs[index][minVer], 2) - 1
+                      } else {
+                          console.log("Something's wrong because this case can't happen!")
+                      }
+
+                      if ((b * b) - (4 * a * c) < 0){
+                        //If the discriminant for the quadratic equation is <0, reduce to 1-dimensional case
+                        val = Math.min(adjacents[minHor], adjacents[minVer])
+                        if (val < Infinity){
+                          //Add total cost to the min of the neighboring potentials
+                          phi = (adjacents[minHor] <= adjacents[minVer]) * costs[index][minHor]
+                          + ((adjacents[minHor] > adjacents[minVer]) * costs[index][minVer]) + val
+                        }
+                      } else {
+                          phi = solveQuadratic(a, b, c)
+                      }
+                      //Update the cell's potential
+                      if (phi < potential[index]){
+                          potential[index] = phi
+                          //Mark as candidate and insert to candidates
+                          if (states[index] == 2){
+                              states[index] = 1
+                              candidates.insert(index)
+                          }
+
+                      }
+                  }
+            });
+        }
+        //Add neighbors of currently known cells to candidates array
+        for (var i = 0; i < goalarea.length; i++){
+            calcNeighbors(getNeighbors(goalarea[i]));
+        }
+
+        //Run fast marching algorithm until all candidates have been marked as known
+        while (!candidates.isEmpty()){
+            //Get the candidate cell with the smallest potential
+            candidate = candidates.del();
+            //Label this cell as known/accepted
+            states[candidate] = 0;
+            calcNeighbors(getNeighbors(candidate));
+        }
+
+    }
+
+    //Calculate gradients
+    function calculateGradients(){
+        for (var i = 0; i < gradPhi.length; i++){
+            adjacents = neighboringPotential(i);
+            for (var j = 0; j < 4; j++){
+                if (potential[i] < Infinity && adjacents[j] < Infinity){
+                    gradPhi[i][j] = adjacents[j] - potential[i];
+                } else {
+                  //In all of these cases at least one of the potentials is undefined so the gradient is also undefined
+                  gradPhi[i][j] = Infinity;
+                }
+            }
+
+            var dx, dy = 0;
+            if (gradPhi[i][0] < Infinity && gradPhi[i][2] < Infinity){
+                dx = (gradPhi[i][0] - gradPhi[i][2]) / 2;
+            } else if (gradPhi[i][0] < Infinity){
+                dx = gradPhi[i][0];
+            } else if (gradPhi[i][2] < Infinity){
+                dx = -1 * gradPhi[i][2];
+            } else {
+                //This is either out of bounds or surrounded by obstacles
+                //in this case set dx = 0
+                dx = 0;
+            }
+
+            if (gradPhi[i][1] < Infinity && gradPhi[i][3] < Infinity){
+                dy = (gradPhi[i][1] - gradPhi[i][3]) / 2;
+            } else if (gradPhi[i][1] < Infinity){
+                dy = gradPhi[i][1];
+            } else if (gradPhi[i][3] < Infinity){
+                dy = -1 * gradPhi[i][3];
+            } else {
+                //This is either out of bounds or surrounded by obstacles
+                //in this case set dy = 0
+                dy = 0;
+            }
+
+            //Calculate Velocities
+            if (dx != 0 || dy != 0){
+                norm_grad = new Vector2D(dx, dy).normalize();
+                for (var j = 0; j < 4; j++){
+                    //Velocity is negative of speed * gradient
+                    velocities[i][j] = norm_grad.scalarMult(-1 * speeds[i][j]);
+                }
+                speed = 0;
+                //The direction of the normalized gradient
+                theta = norm_grad.angle();
+                //Interpolate between the speeds on the 4 faces of the cell
+                //Javascript uses the (-pi, pi] branch of theta
+                tau = Math.PI / 2; //Finally tau is more useful than pi!
+                if (0 < theta && theta <= tau)
+                    //First quadrant: between east and north
+                    speed = ((1 - (theta / tau)) * speeds[i][0]) + ((theta / tau) * speeds[i][3]);
+                else if (tau < theta && theta <= Math.PI)
+                    //First quadrant: between north and west
+                    speed = ((1 - ((theta - tau) / tau)) * speeds[i][3]) + (((theta - tau) / tau) * speeds[i][2]);
+                else if (-1.0 * Math.PI < theta && theta <= -1.0 * tau)
+                    //Third quadrant: between west and south
+                    speed = ((1 - ((theta + Math.PI) / tau)) * speeds[i][2]) + (((theta + Math.PI) / tau) * speeds[i][1]);
+                else if (-1.0 * tau < theta && theta <= 0)
+                    //Fourth quadrant: between south and east
+                    speed = ((1 - ((theta + tau) / tau)) * speeds[i][1]) + (((theta + tau) / tau) * speeds[i][0]);
+                //Add up all the velocities at the 4 faces
+                totalVel[i] = norm_grad.scalarMult(-1.0 * speed);
+            } else {
+                //Here we cannot normalize the gradient so we set velocity to 0
+                for (var j = 0; j < 4; j++){
+                    //Velocity is negative of speed * gradient
+                    velocities[i][j] = new Vector2D(0, 0);
+                }
+                //Here total velocity for the cell is also 0
+                totalVel[i] = new Vector2D(0, 0);
+            }
+        }
+
+    }
+
+
+    //Given (x, y) coordinates of a cell center, return the total velocity of that cell
+    function lookup(pos){
+        return totalVel[(Math.floor(pos.y / gridWidth) + 1) * (gridHor + 1)
+          + (Math.floor(pos.x / gridWidth) + 1)];
+    }
+
+    function moveAgents(){
+        //Move each agent by the interpolated velocities
+        for (var i = 0; i < agents.length; i++){
+            agent = agents[i];
+            //Calculates which cell the agent is in, then the agent is bound
+            //by the 4 vertices of that cell
+            coords = agent.gridCoords();
+            //Gets closest cell center northwest of agent
+            closest = agent.closestGrid();
+            //Calculate the four cell centers (which are the 4 vertices we put into bilinearInterpolation)
+            a = closest.add(new Vector2D(0, -1 * gridWidth));
+            b = a.add(new Vector2D(gridWidth, 0));
+            c = closest;
+            d = c.add(new Vector2D(gridWidth, 0));
+            v = bilinearInterpolation(lookup, a, b, c, d, agent.getPos());
+            agent.setVel(v);   //Set new Velocities
+            agent.setPos(agent.getPos().add(v.scalarMult(agent.speed))); //Move agent according to its speed
+        }
+
+    }
+
+    function enforceDistance(){
+        //For each pair of agents, enforce a threshold distance between them
+        for (var i = 0; i < agents.length; i++){
+          for (var j = i + 1; j < agents.length; j++){
+              //Calculate their distance
+              pos1 = agents[i].getPos();
+              pos2 = agents[j].getPos();
+              delta = pos1.subtract(pos2);
+              distance = delta.modulus();
+              //If too close then push them apart by distance of (threshold - distance) / 2
+              if (distance < threshold){
+                  diff = (threshold - distance) / 2.0;
+                  newPos1 = pos1.add(delta.normalize().scalarMult(diff));
+                  newPos2 = pos2.subtract(delta.normalize().scalarMult(diff));
+                  agents[i].setPos(newPos1);
+                  agents[j].setPos(newPos2);
+              }
+          }
+        }
+    }
+
+    //If pos is a position that's out of bounds, pull it inside along dir
+    function stayinbounds(pos, dir){
+
+    }
+
+    //Find the orthogonal neighbors of a cell
+    function getNeighbors(index){
+        j = Math.floor(index / (gridHor + 1)) - 1;
+        k = index % (gridHor + 1) - 1;
+        //Populate with negative indices (don't exist in the array) and infinite(undefined) potential
+        //So if the neighbor is a known cell or out of bounds it's treated as having undefined potential
+        n = new Array();
+        //Only add if it's not already in arr
+        if (!outOfBounds(j-1, k)){ //North
+            n.push(j * (gridHor + 1) + (k + 1));
+        }
+        if (!outOfBounds(j+1, k)){ //South
+            n.push((j+2) * (gridHor + 1) + (k + 1));
+        }
+        if (!outOfBounds(j, k+1)){ //East
+            n.push((j+1) * (gridHor + 1) + (k + 2));
+        }
+        if (!outOfBounds(j, k-1)){ //West
+            n.push((j+1) * (gridHor + 1) + k);
+        }
+        return n;
+    }
+
+    /* Find potentials of the neighboring cells
+      0th item is eastern neighbor, 1st item is southern neighbor, etc.
+      (following our cardinal conventions)
+    */
+    function neighboringPotential(index){
+        j = Math.floor(index / (gridHor + 1)) - 1;
+        k = index % (gridHor + 1) - 1;
+        //Populate with infinity potential, so that "cells" which are out of out of bounds will be disregarded automatically
+        n = new Array(Infinity, Infinity, Infinity, Infinity);
+        //Only add if it's not already in arr
+        if (!outOfBounds(j-1, k)){ //North
+            n[3] = potential[j * (gridHor + 1) + (k + 1)];
+        }
+        if (!outOfBounds(j+1, k)){ //South
+            n[1] = potential[(j+2) * (gridHor + 1) + (k + 1)];
+        }
+        if (!outOfBounds(j, k+1)){ //East
+            n[0] = potential[(j+1) * (gridHor + 1) + (k + 2)];
+        }
+        if (!outOfBounds(j, k-1)){ //West
+            n[2] = potential[(j+1) * (gridHor + 1) + k];
+        }
+        return n;
+    }
+
+    function outOfBounds(j, k){
+        return (j < 0) || (j > gridVer - 1) || (k < 0) || (k > gridHor - 1);
+    }
+
+    function clearQuantities(){
+        for (var i = 0; i < densityField.length; i++){
+            densityField[i] = 0;
+            velocities[i] = new Array(new Vector2D(0, 0), new Vector2D(0, 0),
+                new Vector2D(0, 0), new Vector2D(0, 0));
+            potential[i] = Infinity;
+            avgVel[i] = new Vector2D(0, 0);
+            totalVel[i] = new Vector2D(0, 0);
+            speeds[i] = new Array(0, 0, 0, 0);
+            gradPhi[i] = new Array(0, 0, 0, 0);
+            costs[i] = new Array(0, 0, 0, 0);
+            states[i] = 2;
+        }
+    }
+
+    function update(){
+        //Clear grids for the next calculation
+        clearQuantities();
+        //Calculate density field
+        calcDensities();
+        //For each group
+        //Update unit cost field
+        calcCosts();
+        //Construct potential and its gradient
+
+        //t1 = Date.now();
+        calculatePotential();
+        //t2 = Date.now();
+        //console.log("Time taken to calculate the potential field:" + (t2 - t1) + "ms.");
+        //Calculate potential gradients and velocities
+        calculateGradients();
+        //Update agents' locations
+        moveAgents();
+        //Enforce minimum distance between agents
+        enforceDistance();
+    }
+
+    function render(t){
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#FF0000";
+      agents.forEach(agent =>
+          ctx.fillRect(agent.pos.x, agent.pos.y, agent.size, agent.size));
+      ctx.font = "7px Arial";
+      ctx.fillStyle = "blue";
+      for (var j = -1; j < gridVer; j++){
+          for (var k = -1; k < gridHor; k++){
+            if (j >= 0 && j < gridVer && k >= 0 && k < gridHor){
+                //ctx.fillText(densityField[(j + 1) * (gridHor + 1) + (k + 1)].toFixed(1), (k + 0.5) * gridWidth, (j + 0.5) * gridWidth);
+                ctx.fillStyle = "green";
+                //ctx.fillText(potential[(j + 1) * (gridHor + 1) + (k + 1)].toFixed(1), (k + 0.5) * gridWidth, (j + 0.5) * gridWidth);
+                //ctx.fillText("(" + totalVel[(j + 1) * (gridHor + 1) + (k + 1)].x.toFixed(1) +","+
+                //totalVel[(j + 1) * (gridHor + 1) + (k + 1)].y.toFixed(1)+")", (k + 0.5) * gridWidth, (j + 0.5) * gridWidth);
+                vec = totalVel[(j + 1) * (gridHor + 1) + (k + 1)];
+                //vec = avgVel[(j + 1) * (gridHor + 1) + (k + 1)];
+                drawLineWithArrows((k + 0.5) * gridWidth, (j + 0.5) * gridWidth,(k + 0.5) * gridWidth + (vec.x * 0.5 * gridWidth), (j + 0.5) * gridWidth +(vec.y * 0.5 * gridWidth),3,5,false,true);
+                //ctx.fillText("(" + avgVel[(j + 1) * (gridHor + 1) + (k + 1)].x +","+
+                //avgVel[(j + 1) * (gridHor + 1) + (k + 1)].y+")", (k + 0.5) * gridWidth, (j + 0.5) * gridWidth);
+                //ctx.fillText(avgVel[(j + 1) * (gridHor + 1) + (k + 1)].modulus(), (k + 0.5) * gridWidth, (j + 0.5) * gridWidth);
+                /*
+                ctx.fillText(speeds[(j + 1) * (gridHor + 1) + (k + 1)][0], (k + 0.85) * gridWidth, (j + 0.5) * gridWidth);
+                ctx.fillText(speeds[(j + 1) * (gridHor + 1) + (k + 1)][1], (k + 0.5) * gridWidth, (j + 0.85) * gridWidth);
+                ctx.fillText(speeds[(j + 1) * (gridHor + 1) + (k + 1)][2], (k + 0.15) * gridWidth, (j + 0.5) * gridWidth);
+                ctx.fillText(speeds[(j + 1) * (gridHor + 1) + (k + 1)][3], (k + 0.5) * gridWidth, (j + 0.15) * gridWidth);
+                */
+            }
+          }
+      }
+    }
+
+    var req;
+    function gameLoop(current){
+        current = Date.now();
+        elapsed = current - prev;
+        prev = current;
+        lag += elapsed;
+
+        while (lag >= MS_PER_UPDATE) {
+            //Update
+            t1 = Date.now();
+            update();
+            t2 = Date.now();
+            console.log("Time taken to update agents:" + (t2 - t1) + "ms.");
+            lag -= MS_PER_UPDATE;
+        }
+        //console.log(lag);
+        //Render
+        render(lag / MS_PER_UPDATE);
+
+        //window.cancelAnimationFrame(req);
+        window.requestAnimationFrame(gameLoop);
+
+    }
+
+    function solveQuadratic(a, b, c){
+        return (-b + Math.sqrt(b * b - (4 * a * c)))/(2 * a);
+    }
+
+    /*Assume that x is in the convex hull of (a, b, c, d) (which forms a square)
+    Bilinearly interpolates a function between the values f(a), f(b), f(c), f(d)
+    to estimate f(x).
+    Also assume that a.x < b.x, c.x < d.x, and a.y < c.y and that they are
+    coordinates for cell centers
+    a--------b
+    |   x    |
+    |        |
+    c--------d
+    */
+    function bilinearInterpolation(func, a, b, c, d, p){
+        //First interpolate in the x-direction
+        f_x_y1 = func(c).scalarMult((b.x - p.x) / (b.x - a.x)).add(
+            func(d).scalarMult((p.x - a.x) / (b.x - a.x)));
+        f_x_y2 = func(a).scalarMult((b.x - p.x) / (b.x - a.x)).add(
+            func(b).scalarMult((p.x - a.x) / (b.x - a.x)));
+        //Then interpolate in the y-direction
+        return f_x_y1.scalarMult((p.y - a.y) / (c.y - a.y)).add(
+            f_x_y2.scalarMult((c.y - p.y) / (c.y - a.y)));
+    }
+
+    function drawLineWithArrows(x0,y0,x1,y1,aWidth,aLength,arrowStart,arrowEnd){
+        var dx=x1-x0;
+        var dy=y1-y0;
+        var angle=Math.atan2(dy,dx);
+        var length=Math.sqrt(dx*dx+dy*dy);
+        //
+        ctx.translate(x0,y0);
+        ctx.rotate(angle);
+        ctx.beginPath();
+        ctx.moveTo(0,0);
+        ctx.lineTo(length,0);
+        if(arrowStart){
+            ctx.moveTo(aLength,-aWidth);
+            ctx.lineTo(0,0);
+            ctx.lineTo(aLength,aWidth);
+        }
+        if(arrowEnd){
+            ctx.moveTo(length-aLength,-aWidth);
+            ctx.lineTo(length,0);
+            ctx.lineTo(length-aLength,aWidth);
+        }
+        //
+        ctx.stroke();
+        ctx.setTransform(1,0,0,1,0,0);
+    }
+
+</script>
+
+</body>
+</html>
