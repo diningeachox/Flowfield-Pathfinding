@@ -1,4 +1,4 @@
-# Flowfield
+# Flowfield Pathfinding
 A javascript implementation of the flowfield algorithm in the paper https://grail.cs.washington.edu/projects/crowd-flows/78-treuille.pdf by Treuille, Cooper, and Popovic. This algorithm is used for pathfinding with large groups. 
  
 Simply run the main.html file with any modern browser. 
